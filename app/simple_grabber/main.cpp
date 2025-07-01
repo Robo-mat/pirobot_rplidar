@@ -1,45 +1,25 @@
-/*
- *  SLAMTEC LIDAR
- *  Simple Data Grabber Demo App
- *
- *  Copyright (c) 2009 - 2014 RoboPeak Team
- *  http://www.robopeak.com
- *  Copyright (c) 2014 - 2020 Shanghai Slamtec Co., Ltd.
- *  http://www.slamtec.com
- *
- */
-/*
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- */
+// include soliti
+#include <iostream>
+#include <fstream>
+#include <signal.h>
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+// librerie lidar
+#include <rplidar.h>
+//#include <sl_lidar.h>
+//#include <sl_lidar_driver.h>
 
-#include "sl_lidar.h" 
-#include "sl_lidar_driver.h"
+// libreria ZMQ
+#include <zmq.hpp> // Assicurati che zmq.hpp sia accessibile (di solito in /usr/local/include o simile)
+#include <thread>  // Per std::this_thread::sleep_for
+#include <chrono>  // Per std::chrono::milliseconds
 
-#ifndef _countof
-#define _countof(_Array) (int)(sizeof(_Array) / sizeof(_Array[0]))
-#endif
+// trova la dimensione di un array
+#define get_size(_Array) (int)(sizeof(_Array) / sizeof(_Array[0]))
 
-#ifdef _WIN32
-#include <Windows.h>
-#define delay(x)   ::Sleep(x)
-#else
+// roba Mac/Linux
 #include <unistd.h>
+
+// sleep per ms
 static inline void delay(sl_word_size_t ms){
     while (ms>=1000){
         usleep(1000*1000);
@@ -48,271 +28,190 @@ static inline void delay(sl_word_size_t ms){
     if (ms!=0)
         usleep(ms*1000);
 }
-#endif
 
+// namespace di slamtec e std
 using namespace sl;
+using namespace std;
 
-void print_usage(int argc, const char * argv[])
-{
-    printf("Simple LIDAR data grabber for SLAMTEC LIDAR.\n"
-           "Version:  %s \n"
-           "Usage:\n"
-           " For serial channel %s --channel --serial <com port> [baudrate]\n"
-           " The baudrate used by different models is as follows:\n"
-           "  A1(115200),A2M7(256000),A2M8(115200),A2M12(256000),"
-           "A3(256000),S1(256000),S2(1000000),S3(1000000)\n"
-		   " For udp channel %s --channel --udp <ipaddr> [port NO.]\n"
-           "The LPX default ipaddr is 192.168.11.2,and the port NO.is 8089. Please refer to the datasheet for details.\n"
-           , SL_LIDAR_SDK_VERSION,  argv[0], argv[0]);
+// create the driver instance
+ILidarDriver * lidar;
+
+// porta seriale
+IChannel* channel;
+
+void ctrlc(int signum);
+
+void stop_lidar(string msg);
+void check_health();
+void init_lidar();
+
+void stop_lidar(string msg=""){
+    cerr<<msg<<"\n";
+
+    lidar->stop();
+    delay(20);
+
+    lidar->setMotorSpeed(0);
+
+    if(lidar) {
+        delete lidar;
+        lidar = NULL;
+    }
+
+    if(channel) {
+        delete channel;
+        channel = NULL;
+    }
+
+    exit(0);
 }
 
-
-void plot_histogram(sl_lidar_response_measurement_node_hq_t * nodes, size_t count)
-{
-    const int BARCOUNT =  75;
-    const int MAXBARHEIGHT = 20;
-    // const float ANGLESCALE = 360.0f/BARCOUNT;
-
-    float histogram[BARCOUNT];
-    for (int pos = 0; pos < _countof(histogram); ++pos) {
-        histogram[pos] = 0.0f;
-    }
-
-    float max_val = 0;
-    for (int pos =0 ; pos < (int)count; ++pos) {
-        int int_deg = (int)(nodes[pos].angle_z_q14 * 90.f / 16384.f);
-        if (int_deg >= BARCOUNT) int_deg = 0;
-        float cachedd = histogram[int_deg];
-        if (cachedd == 0.0f ) {
-            cachedd = nodes[pos].dist_mm_q2/4.0f;
-        } else {
-            cachedd = (nodes[pos].dist_mm_q2/4.0f + cachedd)/2.0f;
-        }
-
-        if (cachedd > max_val) max_val = cachedd;
-        histogram[int_deg] = cachedd;
-    }
-
-    for (int height = 0; height < MAXBARHEIGHT; ++height) {
-        float threshold_h = (MAXBARHEIGHT - height - 1) * (max_val/MAXBARHEIGHT);
-        for (int xpos = 0; xpos < BARCOUNT; ++xpos) {
-            if (histogram[xpos] >= threshold_h) {
-                putc('*', stdout);
-            }else {
-                putc(' ', stdout);
-            }
-        }
-        printf("\n");
-    }
-    for (int xpos = 0; xpos < BARCOUNT; ++xpos) {
-        putc('-', stdout);
-    }
-    printf("\n");
+// Funzione per gestire il segnale Ctrl+C
+void ctrlc(int signum){
+    cout<<"CTRL-C pressed. Closing...\n";
+    stop_lidar();
+    exit(0);
 }
 
-sl_result capture_and_display(ILidarDriver * drv)
-{
-    sl_result ans;
-    
-	sl_lidar_response_measurement_node_hq_t nodes[8192];
-    size_t   count = _countof(nodes);
-
-    printf("waiting for data...\n");
-
-    ans = drv->grabScanDataHq(nodes, count, 0);
-    if (SL_IS_OK(ans) || ans == SL_RESULT_OPERATION_TIMEOUT) {
-        drv->ascendScanData(nodes, count);
-        plot_histogram(nodes, count);
-
-        printf("Do you want to see all the data? (y/n) ");
-        int key = getchar();
-        if (key == 'Y' || key == 'y') {
-            for (int pos = 0; pos < (int)count ; ++pos) {
-				printf("%s theta: %03.2f Dist: %08.2f \n", 
-                    (nodes[pos].flag & SL_LIDAR_RESP_HQ_FLAG_SYNCBIT) ?"S ":"  ", 
-                    (nodes[pos].angle_z_q14 * 90.f) / 16384.f,
-                    nodes[pos].dist_mm_q2/4.0f);
-            }
-        }
-    } else {
-        printf("error code: %x\n", ans);
-    }
-
-    return ans;
-}
-
-int main(int argc, const char * argv[]) {
-	const char *opt_channel = NULL;
-    const char *opt_channel_param_first = NULL;
-    sl_u32      opt_channel_param_second = 0;
-    sl_result   op_result;
-	int         opt_channel_type = CHANNEL_TYPE_SERIALPORT;
-
-    IChannel* _channel;
-
-    if (argc < 5) {
-        print_usage(argc, argv);
-        return -1;
-    }
-
-	const char * opt_is_channel = argv[1];
-	if(strcmp(opt_is_channel, "--channel")==0)
-	{
-		opt_channel = argv[2];
-		if(strcmp(opt_channel, "-s")==0||strcmp(opt_channel, "--serial")==0)
-		{
-			opt_channel_param_first = argv[3];
-			if (argc>4) opt_channel_param_second = strtoul(argv[4], NULL, 10);
-		}
-		else if(strcmp(opt_channel, "-u")==0||strcmp(opt_channel, "--udp")==0)
-		{
-			opt_channel_param_first = argv[3];
-			if (argc>4) opt_channel_param_second = strtoul(argv[4], NULL, 10);
-			opt_channel_type = CHANNEL_TYPE_UDP;
-		}
-		else
-		{
-			print_usage(argc, argv);
-			return -1;
-		}
-	}
-    else
-	{
-		print_usage(argc, argv);
-		return -1;
-	}
-
-    // create the driver instance
-	ILidarDriver * drv = *createLidarDriver();
-
-    if (!drv) {
-        fprintf(stderr, "insufficent memory, exit\n");
-        exit(-2);
-    }
-
+void check_health(){
+    // calcola health info e controlla che tutto sia a posto
     sl_lidar_response_device_health_t healthinfo;
-    sl_lidar_response_device_info_t devinfo;
-    do {
-        // try to connect
-        if (opt_channel_type == CHANNEL_TYPE_SERIALPORT) {
-            _channel = (*createSerialPortChannel(opt_channel_param_first, opt_channel_param_second));
+
+    if (SL_IS_FAIL( lidar->getHealth(healthinfo) ))
+        stop_lidar("Error: cannot retrieve the lidar health code");
+
+    if (healthinfo.status == SL_LIDAR_STATUS_ERROR)
+        stop_lidar("Error: slamtec lidar internal error detected. Please reboot the device to retry.");
+}
+
+void init_lidar(){
+    
+    channel = *createSerialPortChannel("/dev/tty.usbserial-11110", 460800);
+
+    ///  Create a LIDAR driver instance
+    lidar = *createLidarDriver();
+    auto res = lidar->connect(channel);
+
+    if(SL_IS_OK(res)){
+        sl_lidar_response_device_info_t deviceInfo;
+        res = lidar->getDeviceInfo(deviceInfo);
+        if(SL_IS_OK(res)){
+            printf("Model: %d, Firmware Version: %d.%d, Hardware Version: %d\n",
+            deviceInfo.model,
+            deviceInfo.firmware_version >> 8, deviceInfo.firmware_version & 0xffu,
+            deviceInfo.hardware_version);
+        }else{
+            fprintf(stderr, "Failed to get device information from LIDAR %08x\r\n", res);
         }
-        else if (opt_channel_type == CHANNEL_TYPE_UDP) {
-            _channel = *createUdpChannel(opt_channel_param_first, opt_channel_param_second);
-        }
+    }else{
+        fprintf(stderr, "Failed to connect to LIDAR %08x\r\n", res);
+    }
+
+    // accende il motore
+    lidar->setMotorSpeed();
+
+    LidarScanMode scanMode;
+
+    if (SL_IS_FAIL( lidar->startScan(false, true, 0, &scanMode) )) // you can force slamtec lidar to perform scan operation regardless whether the motor is rotating
+        stop_lidar("Error: cannot start the scan operation.");
+}
+
+struct LidarPoint {
+    float angle;
+    float distance;
+
+    LidarPoint() {};
+    LidarPoint(float a, float d): angle(a), distance(d) {};
+};
+
+struct TimeDiff {
+    float start, end, diff;
+
+    TimeDiff() {};
+    TimeDiff(float s, float e, float d): start(s), end(e), diff(d) {};
+};
+
+int main(){
+
+    init_lidar();
+
+    signal(SIGINT, ctrlc);
+    delay(3000);
+
+    // 1. Inizializza il contesto ZeroMQ
+    zmq::context_t context(1); // 1 thread IO
+
+    // 2. Crea un socket PUBLISHER
+    zmq::socket_t publisher(context, zmq::socket_type::pub);
+
+    // Lega il publisher a un indirizzo. IPC è per la comunicazione locale veloce.
+    // Puoi anche usare "tcp://*:5556" per la comunicazione di rete.
+    publisher.bind("ipc:///tmp/lidar_data"); 
+    // publisher.bind("tcp://*:5556"); // Alternativa per rete
+
+    cout << "Publisher C++ avviato. Invio dati LiDAR..." << endl;
+    vector<LidarPoint> data;
+
+    int data_count = 0;
+
+    while(1){
+
+        sl_lidar_response_measurement_node_hq_t nodes[8192];
+        size_t count = 8192;
+        sl_result res = lidar->grabScanDataHq(nodes, count, 1000);
+
+        if (SL_IS_OK(res)) {
+            lidar->ascendScanData(nodes, count);
+
+            data.clear();
+            data.reserve(500);
+
+            float angle, dist;
+            /* float last_angle = 0, diff;
+            vector<TimeDiff> diffs; */
+
+            for (int pos = 0; pos < (int)count ; pos++){
+                
+                angle = ((nodes[pos].angle_z_q14 * 90.f) / 16384.f);
+                dist = (nodes[pos].dist_mm_q2/4.0f);
+
+                //if(dist < 1e-4) continue;
+
+                data.emplace_back(angle, dist);
         
-        if (SL_IS_FAIL((drv)->connect(_channel))) {
-			switch (opt_channel_type) {	
-				case CHANNEL_TYPE_SERIALPORT:
-					fprintf(stderr, "Error, cannot bind to the specified serial port %s.\n"
-						, opt_channel_param_first);
-					break;
-				case CHANNEL_TYPE_UDP:
-					fprintf(stderr, "Error, cannot connect to the ip addr %s with the udp port %u.\n"
-						, opt_channel_param_first, opt_channel_param_second);
-					break;
-			}
-        }
-
-        // retrieving the device info
-        ////////////////////////////////////////
-        op_result = drv->getDeviceInfo(devinfo);
-
-        if (SL_IS_FAIL(op_result)) {
-            if (op_result == SL_RESULT_OPERATION_TIMEOUT) {
-                // you can check the detailed failure reason
-                fprintf(stderr, "Error, operation time out.\n");
-            } else {
-                fprintf(stderr, "Error, unexpected error, code: %x\n", op_result);
-                // other unexpected result
+                //file<<angle<<" "<<dist<<"\n";
+                /* diff = abs(angle-last_angle);
+                if(diff > 10)
+                    diffs.emplace_back(last_angle, angle, diff);
+                
+                last_angle = angle; */
             }
-            break;
-        }
 
-        // print out the device serial number, firmware and hardware version number..
-        printf("SLAMTEC LIDAR S/N: ");
-        for (int pos = 0; pos < 16 ;++pos) {
-            printf("%02X", devinfo.serialnum[pos]);
-        }
+            /* angle = data[0].angle;
+            diff = 360-abs(angle-last_angle);
+            if(diff > 10)
+                diffs.emplace_back(last_angle, angle, diff); */
 
-        printf("\n"
-                "Version:  %s \n"
-                "Firmware Ver: %d.%02d\n"
-                "Hardware Rev: %d\n"
-                , "SL_LIDAR_SDK_VERSION"
-                , devinfo.firmware_version>>8
-                , devinfo.firmware_version & 0xFF
-                , (int)devinfo.hardware_version);
+            // Serializza i dati
+            // Copia i dati dal vector direttamente in un messaggio ZMQ
+            // Ogni LidarPoint ha 2 float, ogni float sono 4 byte. Quindi 2 * 4 = 8 byte per punto.
+            size_t data_size = data.size() * sizeof(LidarPoint);
+            zmq::message_t message(data_size);
+            memcpy(message.data(), data.data(), data_size);
 
-
-        // check the device health
-        ////////////////////////////////////////
-        op_result = drv->getHealth(healthinfo);
-        if (SL_IS_OK(op_result)) { // the macro IS_OK is the preperred way to judge whether the operation is succeed.
-            printf("Lidar health status : ");
-            switch (healthinfo.status) 
-			{
-				case SL_LIDAR_STATUS_OK:
-					printf("OK.");
-					break;
-				case SL_LIDAR_STATUS_WARNING:
-					printf("Warning.");
-					break;
-				case SL_LIDAR_STATUS_ERROR:
-					printf("Error.");
-					break;
-            }
-            printf(" (errorcode: %d)\n", healthinfo.error_code);
+            // Invia i dati tramite il socket PUBLISHER
+            publisher.send(message, zmq::send_flags::none);
+            
+            //for(auto &d:diffs)
+            //    cout<<"Diff "<<d.start<<"-"<<d.end<<" ("<<d.diff<<")\n";
+            cout<<"Inviati "<<data.size()<<" punti ("<<(++data_count)<<")\n";
+            
 
         } else {
-            fprintf(stderr, "Error, cannot retrieve the lidar health code: %x\n", op_result);
-            break;
+            cout<<"Error: "<<res<<"\n";
+            stop_lidar();
         }
-
-
-        if (healthinfo.status == SL_LIDAR_STATUS_ERROR) {
-            fprintf(stderr, "Error, slamtec lidar internal error detected. Please reboot the device to retry.\n");
-            // enable the following code if you want slamtec lidar to be reboot by software
-            // drv->reset();
-            break;
-        }
-
-		switch (opt_channel_type) 
-		{	
-			case CHANNEL_TYPE_SERIALPORT:
-				drv->setMotorSpeed();
-			break;
-		}
-
-        // take only one 360 deg scan and display the result as a histogram
-        ////////////////////////////////////////////////////////////////////////////////
-        if (SL_IS_FAIL(drv->startScan( 0,1 ))) // you can force slamtec lidar to perform scan operation regardless whether the motor is rotating
-        {
-            fprintf(stderr, "Error, cannot start the scan operation.\n");
-            break;
-        }
-
-		delay(3000);
-
-        if (SL_IS_FAIL(capture_and_display(drv))) {
-            fprintf(stderr, "Error, cannot grab scan data.\n");
-            break;
-
-        }
-
-    } while(0);
-
-    drv->stop();
-    switch (opt_channel_type) 
-	{	
-		case CHANNEL_TYPE_SERIALPORT:
-			delay(20);
-			drv->setMotorSpeed(0);
-		break;
-	}
-    if(drv) {
-        delete drv;
-        drv = NULL;
     }
+
     return 0;
 }
